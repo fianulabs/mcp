@@ -1,0 +1,137 @@
+name = "mcp-compliance-intelligence"
+main = "src/index.ts"
+compatibility_date = "2024-11-20"
+compatibility_flags = ["nodejs_compat"]
+account_id = "6841d88809021dab1138d0451d92f94e"
+
+# Cloudflare Workers configuration
+workers_dev = true
+
+# Durable Objects for stateful MCP sessions
+[[durable_objects.bindings]]
+name = "COMPLIANCE_MCP"
+class_name = "ComplianceMCP"
+
+# Migrations for Durable Objects
+[[migrations]]
+tag = "v1"
+new_classes = ["ComplianceMCP"]
+
+# KV Namespace for caching
+[[kv_namespaces]]
+binding = "CACHE_KV"
+id = "5f03055ed9f741f9b0bde029a7cc9f6f"
+
+# Analytics Engine for audit logging
+[[analytics_engine_datasets]]
+binding = "ANALYTICS"
+dataset = "compliance_mcp"
+
+# Environment variables
+[vars]
+ENVIRONMENT = "development"
+CONSULTA_URL = "https://fianu-dev.fianu.io/api"
+AUTH0_DOMAIN = "auth.fianu.io"
+AUTH0_ISSUER = "https://dev-lztnxy5azm8j4zwx.us.auth0.com/"
+AUTH0_AUDIENCE = "https://dev-lztnxy5azm8j4zwx.us.auth0.com/api/v2/"
+MCP_SERVER_NAME = "Fianu Compliance Intelligence"
+MCP_SERVER_VERSION = "0.1.0"
+DEFAULT_TENANT_ID = "org_s8ibVJzfBMf2ULbM"
+
+# Secrets (set via: wrangler secret put SECRET_NAME)
+# - AUTH0_CLIENT_ID
+# - AUTH0_CLIENT_SECRET
+# - AUTH0_AUDIENCE (if needed)
+
+# Staging environment
+[env.staging]
+name = "mcp-compliance-intelligence-staging"
+
+[[env.staging.durable_objects.bindings]]
+name = "COMPLIANCE_MCP"
+class_name = "ComplianceMCP"
+
+[[env.staging.kv_namespaces]]
+binding = "CACHE_KV"
+id = "5f03055ed9f741f9b0bde029a7cc9f6f"
+
+[[env.staging.analytics_engine_datasets]]
+binding = "ANALYTICS"
+dataset = "compliance_mcp_staging"
+
+[env.staging.vars]
+ENVIRONMENT = "staging"
+CONSULTA_URL = "https://fianu-dev.fianu.io/api"
+AUTH0_DOMAIN = "auth.fianu.io"
+AUTH0_ISSUER = "https://dev-lztnxy5azm8j4zwx.us.auth0.com/"
+AUTH0_AUDIENCE = "https://dev-lztnxy5azm8j4zwx.us.auth0.com/api/v2/"
+MCP_SERVER_NAME = "Fianu Compliance Intelligence"
+MCP_SERVER_VERSION = "0.1.0"
+DEFAULT_TENANT_ID = "org_s8ibVJzfBMf2ULbM"
+
+# Production environment
+[env.production]
+name = "mcp-compliance-intelligence"
+workers_dev = false  # Disable workers.dev route, use custom domain only
+
+# Custom domain route (configured via Cloudflare dashboard)
+# mcp.fianu.io -> this worker
+
+[[env.production.durable_objects.bindings]]
+name = "COMPLIANCE_MCP"
+class_name = "ComplianceMCP"
+
+[[env.production.kv_namespaces]]
+binding = "CACHE_KV"
+id = "662c4c91bd7846e5ab596f0e2212dede"
+
+[[env.production.analytics_engine_datasets]]
+binding = "ANALYTICS"
+dataset = "compliance_mcp"
+
+[[env.production.routes]]
+pattern = "mcp.fianu.io/*"
+zone_name = "fianu.io"
+
+[env.production.vars]
+ENVIRONMENT = "production"
+CONSULTA_URL = "https://app.fianu.io/api"
+AUTH0_DOMAIN = "cloudauth.fianu.io"
+AUTH0_ISSUER = "https://fianu.us.auth0.com/"
+AUTH0_AUDIENCE = "https://cloudauth.fianu.io/users"
+MCP_SERVER_NAME = "Fianu Compliance Intelligence"
+MCP_SERVER_VERSION = "0.1.0"
+DEFAULT_TENANT_ID = "fianu"
+
+# Demo environment (demo.fianu.io)
+[env.demo]
+name = "mcp-compliance-intelligence-demo"
+workers_dev = true  # Enable workers.dev route for initial testing
+
+[[env.demo.durable_objects.bindings]]
+name = "COMPLIANCE_MCP"
+class_name = "ComplianceMCP"
+
+[[env.demo.kv_namespaces]]
+binding = "CACHE_KV"
+id = "0ac7ad777b9f40bdb5b7f597047771e4"
+
+[[env.demo.analytics_engine_datasets]]
+binding = "ANALYTICS"
+dataset = "compliance_mcp_demo"
+
+# Route for demo MCP server (can be configured later)
+# [[env.demo.routes]]
+# pattern = "mcp-demo.fianu.io/*"
+# zone_name = "fianu.io"
+
+[env.demo.vars]
+ENVIRONMENT = "demo"
+CONSULTA_URL = "https://demo.fianu.io/api"
+AUTH0_DOMAIN = "cloudauth.fianu.io"
+AUTH0_ISSUER = "https://fianu.us.auth0.com/"
+AUTH0_AUDIENCE = "https://cloudauth.fianu.io/users"
+AUTH0_ORGANIZATION = "org_Wdxjh3JXeqYQBolU"
+MCP_SERVER_NAME = "Fianu Compliance Intelligence (Demo)"
+MCP_SERVER_VERSION = "0.1.0"
+DEFAULT_TENANT_ID = "org_Wdxjh3JXeqYQBolU"
