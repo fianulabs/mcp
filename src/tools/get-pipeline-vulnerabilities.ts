@@ -522,36 +522,40 @@ export async function getPipelineVulnerabilities(
   }
 
   // Step 6: Optional delta analysis (showIntroduced=true)
+  // DELTA METHODOLOGY: Compare vulnerability counts between consecutive commits
+  // - This shows "introduced" vulnerabilities (new findings in current vs previous)
+  // - Count-based approximation: actual individual vulnerabilities may differ
+  // - Use this when user asks about "new", "introduced", or "added" vulnerabilities
   let introduced: any = undefined;
   if (showIntroduced) {
     try {
-      // Find the previous commit with attestations
+      // Find the previous commit with scan attestations
       const commits = await consulta.getAssetCommits(context.assetUuid);
       const currentIndex = commits.findIndex((c: any) => c.commit === context.resolvedCommit);
-      
+
       if (currentIndex >= 0 && currentIndex < commits.length - 1) {
         const previousCommit = commits[currentIndex + 1]?.commit;
-        
+
         if (previousCommit) {
-          // Get attestations for previous commit
+          // Fetch vulnerability attestations from previous commit
           const previousAttestations = await consulta.getAssetAttestations(
             assetIdentifier,
             undefined,
             previousCommit
           );
-          
-          // Filter to vulnerability attestations
+
+          // Filter to security scan controls only
           const previousVulnAttestations = previousAttestations.filter(att => {
             const controlPath = att.control?.path || att.path || att.tag || '';
             return isVulnerabilityControl(controlPath);
           });
-          
-          // Calculate previous totals
+
+          // Aggregate vulnerability counts from previous commit
           let prevCritical = 0;
           let prevHigh = 0;
           let prevMedium = 0;
           let prevLow = 0;
-          
+
           for (const att of previousVulnAttestations) {
             const details = await consulta.getAttestationDetails(att.uuid);
             const vulnDetails = parseVulnerabilityDetails(details?.detail, att.control?.path || '');
@@ -560,7 +564,9 @@ export async function getPipelineVulnerabilities(
             prevMedium += vulnDetails.medium;
             prevLow += vulnDetails.low;
           }
-          
+
+          // Calculate delta (current - previous)
+          // Positive numbers indicate new findings, negative indicate resolved
           introduced = {
             methodology: `Compared vulnerability counts between current commit (${context.resolvedCommit?.substring(0, 7)}) and previous commit (${previousCommit.substring(0, 7)}). Shows the difference in finding counts.`,
             comparedWith: {
@@ -573,7 +579,7 @@ export async function getPipelineVulnerabilities(
               medium: totalMedium - prevMedium,
               low: totalLow - prevLow,
             },
-            note: 'Positive numbers indicate new findings. This is an approximation based on count differences.',
+            note: 'Positive numbers indicate new findings. This is an approximation based on count differences, not individual vulnerability tracking.',
           };
         }
       }

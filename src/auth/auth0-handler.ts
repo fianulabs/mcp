@@ -2,11 +2,21 @@ import type { Env, Auth0Claims } from '../types';
 
 /**
  * Auth0 OAuth handler for MCP server authentication
- * Handles JWT validation and tenant extraction
+ *
+ * MULTI-ISSUER VALIDATION STRATEGY:
+ * Supports both staging and production Auth0 environments with custom domains
+ * - Staging: auth.fianu.io (custom) or dev-lztnxy5azm8j4zwx.us.auth0.com (tenant)
+ * - Production: cloudauth.fianu.io (custom) or fianu.us.auth0.com (tenant)
+ *
+ * JWT VALIDATION FLOW:
+ * 1. Decode header to extract key ID (kid)
+ * 2. Fetch public key from JWKS endpoint (cached for 1 hour)
+ * 3. Verify signature using Web Crypto API
+ * 4. Validate claims: issuer, expiry, audience, tenant ID
  */
 export class Auth0Handler {
   private env: Env;
-  private jwksCache: Map<string, any> = new Map();
+  private jwksCache: Map<string, any> = new Map(); // In-memory cache for JWKS public keys
 
   constructor(env: Env) {
     this.env = env;
@@ -14,10 +24,24 @@ export class Auth0Handler {
 
   /**
    * Validate Auth0 JWT and extract claims
+   *
+   * VALIDATION STEPS:
+   * 1. Extract kid (key ID) from JWT header
+   * 2. Fetch corresponding public key from Auth0 JWKS endpoint
+   * 3. Verify JWT signature using Web Crypto API
+   * 4. Validate issuer (supports multiple issuers for staging/prod)
+   * 5. Validate expiry with 5-minute negative leeway (fail fast)
+   * 6. Validate audience matches configured API audience
+   * 7. Ensure tenant ID claim is present
+   *
+   * @param token - JWT access token from Auth0
+   * @returns Validated JWT claims including user ID and tenant ID
+   * @throws Error if token is invalid, expired, or missing required claims
    */
   async validateToken(token: string): Promise<Auth0Claims> {
     try {
-      // Decode JWT header to get key ID
+      // Step 1: Decode JWT header to get key ID (kid)
+      // JWT format: header.payload.signature (all base64url encoded)
       const [headerB64] = token.split('.');
       const header = JSON.parse(atob(headerB64));
       const kid = header.kid;
@@ -26,22 +50,22 @@ export class Auth0Handler {
         throw new Error('JWT missing kid in header');
       }
 
-      // Get public key from JWKS endpoint
+      // Step 2: Get public key from JWKS endpoint (cached)
       const publicKey = await this.getPublicKey(kid);
 
-      // Verify JWT signature using Web Crypto API
+      // Step 3: Verify JWT signature using Web Crypto API
+      // This ensures the token hasn't been tampered with
       const verified = await this.verifyJWT(token, publicKey);
       if (!verified) {
         throw new Error('JWT signature verification failed');
       }
 
-      // Decode and validate claims
+      // Step 4: Decode and validate claims
       const [, payloadB64] = token.split('.');
       const claims = JSON.parse(atob(payloadB64)) as Auth0Claims;
 
-      // Validate issuer - accept both custom domain and tenant domain
-      // Production: cloudauth.fianu.io / fianu.us.auth0.com
-      // Staging: auth.fianu.io / dev-lztnxy5azm8j4zwx.us.auth0.com
+      // Step 5: Validate issuer - support multiple environments
+      // We accept both custom domains and Auth0 tenant domains for flexibility
       const validIssuers = [
         this.env.AUTH0_ISSUER, // From env: tenant domain
         `https://${this.env.AUTH0_DOMAIN}/`, // From env: custom domain
@@ -52,15 +76,16 @@ export class Auth0Handler {
         'https://cloudauth.fianu.io/',
         'https://fianu.us.auth0.com/',
       ];
-      
+
       if (!validIssuers.includes(claims.iss)) {
         throw new Error(`Invalid issuer: ${claims.iss}. Expected one of: ${validIssuers.join(', ')}`);
       }
 
-      // Validate expiry - check expiration FIRST before any other validation
-      // Use negative leeway to fail faster (fail if token expires within next 5 minutes)
+      // Step 6: Validate expiry with negative leeway (fail fast approach)
+      // Negative leeway means we fail BEFORE the token actually expires
+      // This gives users time to re-authenticate before their session breaks mid-operation
       const now = Math.floor(Date.now() / 1000);
-      const leeway = -300; // Fail if token expires within next 5 minutes (negative = fail faster)
+      const leeway = -300; // Fail if token expires within next 5 minutes
       if (claims.exp <= (now - leeway)) {
         const expiryDate = new Date(claims.exp * 1000).toISOString();
         const nowDate = new Date(now * 1000).toISOString();
@@ -100,14 +125,25 @@ export class Auth0Handler {
 
   /**
    * Get public key from Auth0 JWKS endpoint
+   *
+   * CACHING STRATEGY:
+   * - Public keys are cached in memory for 1 hour
+   * - This reduces latency and avoids rate limiting from Auth0
+   * - Keys are rotated infrequently (Auth0 rotates keys periodically)
+   * - Cache miss triggers a fetch from Auth0's JWKS endpoint
+   *
+   * JWKS (JSON Web Key Set) is the standard way to publish public keys for JWT verification
+   *
+   * @param kid - Key ID from JWT header
+   * @returns CryptoKey for signature verification
    */
   private async getPublicKey(kid: string): Promise<CryptoKey> {
-    // Check cache first
+    // Check cache first to avoid unnecessary network requests
     if (this.jwksCache.has(kid)) {
       return this.jwksCache.get(kid);
     }
 
-    // Fetch JWKS from Auth0
+    // Fetch JWKS from Auth0's well-known endpoint
     const jwksUrl = `https://${this.env.AUTH0_DOMAIN}/.well-known/jwks.json`;
     const response = await fetch(jwksUrl);
 
@@ -122,7 +158,8 @@ export class Auth0Handler {
       throw new Error(`Key ${kid} not found in JWKS`);
     }
 
-    // Import public key
+    // Import the JWK as a CryptoKey for Web Crypto API
+    // RSASSA-PKCS1-v1_5 with SHA-256 is the standard signing algorithm for Auth0 JWTs
     const publicKey = await crypto.subtle.importKey(
       'jwk',
       key,
@@ -131,28 +168,43 @@ export class Auth0Handler {
         hash: 'SHA-256',
       },
       false,
-      ['verify']
+      ['verify'] // Only allow verification operations
     );
 
-    // Cache for 1 hour
+    // Cache for 1 hour (Auth0 keys rarely rotate)
     this.jwksCache.set(kid, publicKey);
-    setTimeout(() => this.jwksCache.delete(kid), 3600000);
+    setTimeout(() => this.jwksCache.delete(kid), 3600000); // 3600000ms = 1 hour
 
     return publicKey;
   }
 
   /**
    * Verify JWT signature using Web Crypto API
+   *
+   * JWT SIGNATURE VERIFICATION PROCESS:
+   * 1. Split JWT into header, payload, and signature
+   * 2. Concatenate header.payload as the signed data
+   * 3. Decode signature from base64url to bytes
+   * 4. Verify signature matches using RSA-SHA256 with public key
+   *
+   * This ensures the JWT was signed by Auth0 and hasn't been tampered with
+   *
+   * @param token - Complete JWT string
+   * @param publicKey - Public key from JWKS
+   * @returns true if signature is valid, false otherwise
    */
   private async verifyJWT(token: string, publicKey: CryptoKey): Promise<boolean> {
     try {
       const [headerB64, payloadB64, signatureB64] = token.split('.');
+
+      // The signed data is "header.payload" (both base64url encoded)
       const data = new TextEncoder().encode(`${headerB64}.${payloadB64}`);
-      
-      // Decode base64url signature
+
+      // Decode signature from base64url to bytes
       const signature = this.base64UrlDecode(signatureB64);
 
-      // Verify signature
+      // Verify signature using Web Crypto API
+      // RSASSA-PKCS1-v1_5 is the RSA signature algorithm used by Auth0
       const verified = await crypto.subtle.verify(
         'RSASSA-PKCS1-v1_5',
         publicKey,

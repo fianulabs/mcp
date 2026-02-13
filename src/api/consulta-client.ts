@@ -247,16 +247,19 @@ export class ConsultaClient {
     };
 
     // Step 1: Resolve asset identifier to UUID and metadata
+    // Uses fuzzy matching because users may provide partial names, codes, or identifiers
+    // We search both application-level and asset-level fields to maximize match rate
     try {
       const complianceData = await this.fetch<ApplicationComplianceResponse[]>(`/evidence/assets/compliance`);
       const applications = Array.isArray(complianceData) ? complianceData : [];
-      
+
       for (const app of applications) {
-        const appMatches = 
+        // Try matching on application-level fields first (app_name, app_code, identifier)
+        const appMatches =
           app.app_name?.toLowerCase().includes(assetIdentifier.toLowerCase()) ||
           app.app_code?.toLowerCase().includes(assetIdentifier.toLowerCase()) ||
           app.identifier?.toLowerCase().includes(assetIdentifier.toLowerCase());
-        
+
         if (appMatches) {
           result.assetName = app.app_name || app.app_code || assetIdentifier;
           result.applicationVersionUuid = app.version_uuid || null;
@@ -321,11 +324,12 @@ export class ConsultaClient {
     }
 
     // Step 2: Get default branch and repository ID from /assets endpoint
+    // Default branch is critical for Step 3 when no branch is specified
     try {
       const assetUrl = `/assets?repository=${encodeURIComponent(assetIdentifier)}`;
       const assetData = await this.fetch<any>(assetUrl);
       const assets = Array.isArray(assetData) ? assetData : [assetData];
-      
+
       for (const asset of assets) {
         if (asset.scm?.defaultBranch) {
           result.defaultBranch = asset.scm.defaultBranch;
@@ -335,23 +339,25 @@ export class ConsultaClient {
         }
         if (result.defaultBranch) break;
       }
-      
+
       console.log(`[resolveAssetContext] Default branch: ${result.defaultBranch}, repositoryId: ${result.repositoryId}`);
     } catch (e) {
       console.log(`[resolveAssetContext] Could not get default branch: ${e}`);
     }
 
     // Step 3: Resolve commit - either from short SHA or from branch
+    // This is the most complex step with two distinct paths
     if (result.assetUuid) {
       try {
         const commitsUrl = `/assets/${result.assetUuid}/commits`;
         const commitsData = await this.fetch<any[]>(commitsUrl);
         const commits = Array.isArray(commitsData) ? commitsData : [];
-        
+
         console.log(`[resolveAssetContext] Found ${commits.length} commits for asset`);
-        
+
         if (commit) {
-          // Case A: User provided a commit - resolve short SHA to full SHA
+          // Case A: User provided a commit SHA - resolve short SHA to full SHA (40 chars)
+          // Git allows short SHAs (7+ chars), but Consulta APIs require full 40-char SHAs
           const isShortCommit = commit.length < 40;
           
           if (isShortCommit) {
@@ -383,11 +389,13 @@ export class ConsultaClient {
             debug.commitResolution = { type: 'full_sha', status: 'used_as_is' };
           }
         } else {
-          // Case B: No commit provided - find latest commit on branch
+          // Case B: No commit provided - find latest commit on the specified/default branch
+          // Fallback chain: user branch → default branch → 'main'
           const targetBranch = branch || result.defaultBranch || 'main';
           result.resolvedBranch = targetBranch;
-          
-          // Filter commits by branch if branch info is available
+
+          // Filter commits by branch - API returns commits with branch metadata
+          // We check multiple fields because API response format varies
           const branchCommits = commits.filter((c: any) => {
             const commitBranch = c.branch || c.ref;
             const commitBranches = c.branches || c.refs || [];
@@ -397,17 +405,18 @@ export class ConsultaClient {
               commitBranches.some((b: any) => b === targetBranch || b.name === targetBranch)
             );
           });
-          
-          // Use branch-filtered commits if available, otherwise all commits
+
+          // Use branch-filtered commits if available, otherwise fall back to all commits
+          // This fallback handles cases where branch metadata is missing
           let targetCommits = branchCommits.length > 0 ? branchCommits : commits;
-          
-          // Sort by timestamp and take the most recent
+
+          // Sort by timestamp (newest first) to get the latest commit
           targetCommits.sort((a: any, b: any) => {
             const timeA = new Date(a.timestamp || a.created_at || a.date || 0).getTime();
             const timeB = new Date(b.timestamp || b.created_at || b.date || 0).getTime();
             return timeB - timeA;
           });
-          
+
           if (targetCommits.length > 0 && targetCommits[0].commit) {
             result.resolvedCommit = targetCommits[0].commit;
             console.log(`[resolveAssetContext] Resolved branch "${targetBranch}" to latest commit: ${result.resolvedCommit}`);
@@ -637,10 +646,24 @@ export class ConsultaClient {
 
   /**
    * Fetch all required controls for an asset from policy gates
-   * Uses /assets/{asset_uuid}/gates/policies/controls endpoint
-   * Also tries /assets/children/{asset_uuid}/gates/policies/controls for applications
+   *
+   * STRATEGY: 4-tier fallback approach because the API doesn't guarantee gate availability
+   * 1. Direct asset gates: /assets/{uuid}/gates/policies/controls
+   * 2. Child asset gates: /assets/children/{uuid}/gates/policies/controls (for applications)
+   * 3. Lookup child assets from compliance data, then query their gates
+   * 4. Fallback: Fetch all org gates and aggregate their controls
+   *
+   * WHY 4 STRATEGIES?
+   * - Applications may have gates at the application level or child repository level
+   * - API endpoints return different results for different asset types
+   * - Some assets don't have gates directly attached but inherit from parent/siblings
+   * - We need to exhaust all possibilities before concluding "no gates"
+   *
    * Returns controls grouped by policy that are REQUIRED for this asset
-   * 
+   *
+   * @param assetUuid - Asset UUID to query
+   * @returns Map of control path/UUID → ControlStatus objects
+   *
    * Public alias: getAssetRequiredControls
    */
   async getAssetRequiredControls(assetUuid: string): Promise<Map<string, ControlStatus>> {
@@ -649,7 +672,7 @@ export class ConsultaClient {
 
   private async getRequiredControlsForAsset(assetUuid: string): Promise<Map<string, ControlStatus>> {
     const requiredControls = new Map<string, ControlStatus>();
-    
+
     // Response structure from API (controlsUnderPolicyGroupV001)
     interface GateResponse {
       name?: string;
@@ -669,14 +692,16 @@ export class ConsultaClient {
       }>;
     }
     
+    // Helper function to parse gate responses and extract control requirements
+    // Used by all 4 strategies to normalize API responses into our control map
     const processGatesResponse = (gatesData: GateResponse[], source: string) => {
       if (!Array.isArray(gatesData) || gatesData.length === 0) {
         console.log(`No gates from ${source}`);
         return;
       }
-      
+
       console.log(`Found ${gatesData.length} policy gates from ${source}`);
-      
+
       for (const gate of gatesData) {
         const policyName = gate.policyName || gate.name || gate.policyEntityKey || 'Policy';
         
@@ -717,6 +742,7 @@ export class ConsultaClient {
       }
       
       // Strategy 2: Child asset gates (for applications with child repositories)
+      // Applications may not have gates themselves, but their child repos do
       if (requiredControls.size === 0) {
         try {
           const childGatesData = await this.fetch<GateResponse[]>(
@@ -727,8 +753,9 @@ export class ConsultaClient {
           console.log(`Child asset gates failed: ${e}`);
         }
       }
-      
-      // Strategy 3: Try looking up child assets from compliance data and query their gates
+
+      // Strategy 3: Lookup child assets from compliance data, then query their gates individually
+      // This handles cases where the /children endpoint doesn't work but we can find children manually
       if (requiredControls.size === 0) {
         try {
           const complianceData = await this.fetch<ApplicationComplianceResponse[]>(`/evidence/assets/compliance`);
@@ -757,14 +784,15 @@ export class ConsultaClient {
         }
       }
 
-      // Strategy 4: If all else fails, try to get all gates and aggregate their controls
-      // This gives a complete picture of what controls could be required
+      // Strategy 4: Last resort - fetch all org gates and aggregate their controls
+      // This gives a complete picture of what controls COULD be required
+      // We limit to 5 gates to avoid rate limiting and excessive API calls
       if (requiredControls.size === 0) {
         try {
           console.log('Trying fallback: fetching all gates and their controls');
           const gates = await this.listGates();
-          
-          // Get controls from all gates (limit to first 5 gates to avoid rate limiting)
+
+          // Get controls from first 5 gates (arbitrary limit to avoid rate limiting)
           for (const gate of gates.slice(0, 5)) {
             const gateControls = await this.getGateRequiredControls(gate.entityKey);
             for (const [key, control] of gateControls) {
