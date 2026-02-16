@@ -96,44 +96,49 @@ export class AuthHandler {
       });
     }
 
-    // Store the MCP client's OAuth state so we can complete the flow after Auth0 callback
+    // Store the MCP client's OAuth parameters so we can complete the MCP flow after Auth0
+    // This includes PKCE parameters (code_challenge) and the redirect_uri to send the final code to
     const oauthState: OAuthState = {
       mcpRedirectUri: redirectUri,
       mcpCodeChallenge: codeChallenge || '',
-      mcpCodeChallengeMethod: codeChallengeMethod || 'S256',
+      mcpCodeChallengeMethod: codeChallengeMethod || 'S256', // SHA-256 for PKCE
       mcpState: state,
       mcpClientId: clientId || '',
     };
 
-    // Generate a unique state for the Auth0 request
+    // Generate a unique state parameter for the Auth0 request (separate from MCP state)
+    // This prevents CSRF attacks on the Auth0 callback
     const auth0State = crypto.randomUUID();
 
-    // Store the state in KV for retrieval during callback
+    // Store the MCP OAuth state in KV, keyed by our Auth0 state parameter
+    // We'll retrieve this in the callback to complete the MCP OAuth flow
     await this.env.CACHE_KV.put(
       `oauth_state:${auth0State}`,
       JSON.stringify(oauthState),
-      { expirationTtl: 600 } // 10 minute expiry
+      { expirationTtl: 600 } // 10 minute expiry - OAuth flows should complete quickly
     );
 
-    // Build Auth0 authorization URL
+    // Build Auth0 authorization URL with all required parameters
     const auth0Domain = this.env.AUTH0_DOMAIN;
     const auth0ClientId = this.env.AUTH0_CLIENT_ID;
     const auth0Audience = this.env.AUTH0_AUDIENCE;
     const auth0Organization = this.env.AUTH0_ORGANIZATION;
 
     const auth0AuthUrl = new URL(`https://${auth0Domain}/authorize`);
-    auth0AuthUrl.searchParams.set('response_type', 'code');
+    auth0AuthUrl.searchParams.set('response_type', 'code'); // Authorization Code flow
     auth0AuthUrl.searchParams.set('client_id', auth0ClientId);
     auth0AuthUrl.searchParams.set('redirect_uri', `${baseUrl}/callback`);
-    auth0AuthUrl.searchParams.set('scope', 'openid profile email');
-    auth0AuthUrl.searchParams.set('state', auth0State);
-    
-    // Add audience if configured (required for API access)
+    auth0AuthUrl.searchParams.set('scope', 'openid profile email'); // Standard OIDC scopes
+    auth0AuthUrl.searchParams.set('state', auth0State); // Our state for CSRF protection
+
+    // Audience parameter tells Auth0 which API we're requesting access to
+    // This is required to get an access token (not just an ID token)
     if (auth0Audience) {
       auth0AuthUrl.searchParams.set('audience', auth0Audience);
     }
-    
-    // Add organization if configured (required for multi-tenant Auth0)
+
+    // Organization parameter enables multi-tenant Auth0 setup
+    // Each tenant/customer can have their own organization
     if (auth0Organization) {
       auth0AuthUrl.searchParams.set('organization', auth0Organization);
     }
@@ -188,7 +193,8 @@ export class AuthHandler {
       });
     }
 
-    // Retrieve the stored MCP OAuth state
+    // Retrieve the MCP OAuth state we stored in handleAuthorize()
+    // This contains the MCP client's redirect_uri and PKCE parameters
     const storedStateJson = await this.env.CACHE_KV.get(`oauth_state:${state}`);
     if (!storedStateJson) {
       console.error('OAuth state not found or expired');
@@ -203,10 +209,11 @@ export class AuthHandler {
 
     const oauthState: OAuthState = JSON.parse(storedStateJson);
 
-    // Clean up the stored state
+    // Clean up the stored state (one-time use only, prevents replay attacks)
     await this.env.CACHE_KV.delete(`oauth_state:${state}`);
 
-    // Exchange the Auth0 authorization code for tokens
+    // Exchange the Auth0 authorization code for Auth0 access token
+    // This is the standard OAuth 2.0 authorization code exchange
     const auth0Domain = this.env.AUTH0_DOMAIN;
     const auth0TokenUrl = `https://${auth0Domain}/oauth/token`;
 
@@ -255,12 +262,19 @@ export class AuthHandler {
 
     console.log('Auth0 token exchange successful');
 
-    // Generate an MCP authorization code that we'll send back to the MCP client
-    // This code can be exchanged for tokens at our /token endpoint
+    // TWO-STEP OAUTH DANCE:
+    // 1. We just exchanged Auth0's code for Auth0 tokens
+    // 2. Now we generate our own MCP authorization code to send to the MCP client
+    // 3. The MCP client will exchange OUR code for OUR tokens at /token endpoint
+    //
+    // This allows us to act as an OAuth provider while using Auth0 as the identity source
     const mcpAuthCode = crypto.randomUUID();
 
-    // Store the Auth0 tokens associated with this MCP auth code
-    // The /token endpoint will retrieve these when the MCP client exchanges the code
+    // Store the Auth0 tokens + MCP PKCE parameters associated with this MCP auth code
+    // The /token endpoint will:
+    // - Verify the PKCE code_verifier matches the stored code_challenge
+    // - Return the Auth0 tokens to the MCP client
+    // - This completes the OAuth flow
     await this.env.CACHE_KV.put(
       `mcp_auth_code:${mcpAuthCode}`,
       JSON.stringify({
@@ -268,19 +282,20 @@ export class AuthHandler {
         auth0IdToken: auth0Tokens.id_token,
         auth0RefreshToken: auth0Tokens.refresh_token,
         auth0ExpiresIn: auth0Tokens.expires_in,
-        mcpCodeChallenge: oauthState.mcpCodeChallenge,
+        mcpCodeChallenge: oauthState.mcpCodeChallenge, // For PKCE verification
         mcpCodeChallengeMethod: oauthState.mcpCodeChallengeMethod,
         mcpClientId: oauthState.mcpClientId,
         mcpRedirectUri: oauthState.mcpRedirectUri,
         createdAt: Date.now(),
       }),
-      { expirationTtl: 300 } // 5 minute expiry for auth codes
+      { expirationTtl: 300 } // 5 minute expiry - auth codes are short-lived (RFC 6749)
     );
 
-    // Redirect back to the MCP client's redirect_uri with our MCP authorization code
+    // Redirect back to the MCP client's redirect_uri with OUR authorization code
+    // The MCP client will now call our /token endpoint to exchange this code for tokens
     const mcpRedirectUrl = new URL(oauthState.mcpRedirectUri);
-    mcpRedirectUrl.searchParams.set('code', mcpAuthCode);
-    mcpRedirectUrl.searchParams.set('state', oauthState.mcpState);
+    mcpRedirectUrl.searchParams.set('code', mcpAuthCode); // Our MCP auth code
+    mcpRedirectUrl.searchParams.set('state', oauthState.mcpState); // Echo back their state
 
     console.log('Redirecting to MCP client:', mcpRedirectUrl.toString());
 

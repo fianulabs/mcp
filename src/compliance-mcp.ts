@@ -134,8 +134,14 @@ export class ComplianceMCP implements DurableObject {
   }
 
   /**
-   * Register all MCP tools
-   * Note: inputSchema must be JSON Schema format, not Zod schema
+   * Register all MCP tools with the MCP server
+   *
+   * ARCHITECTURE NOTE: Tool Registration Pattern
+   * - Each tool must use plain JSON Schema for inputSchema (not Zod schemas)
+   * - Zod schemas fail to serialize properly in the MCP protocol
+   * - All tool handlers are wrapped with withAuditLog() for compliance tracking
+   * - This provides dual logging: console output (for wrangler tail) and Analytics Engine
+   * - Tools are stored in a Map for fast lookup during tools/call requests
    */
   private registerTools(consulta: ConsultaClient) {
     // Tool 1: Get Asset Compliance Status
@@ -892,6 +898,19 @@ PARAMETERS:
 
   /**
    * Wrap tool invocations with audit logging (includes full request/response)
+   *
+   * DUAL LOGGING STRATEGY:
+   * 1. Console logging: Full request/response for real-time debugging via wrangler tail
+   * 2. Analytics Engine: Truncated data for long-term audit trail and analytics
+   *
+   * Why both? Console logs are ephemeral (lost after deployment), while Analytics Engine
+   * persists data for compliance reporting and usage analysis. Analytics has strict
+   * blob size limits (1024 bytes), so we truncate large payloads there.
+   *
+   * @param toolName - Name of the tool being invoked
+   * @param params - Tool input parameters
+   * @param handler - Async function that executes the tool logic
+   * @returns Tool result (or throws on error)
    */
   private async withAuditLog<T>(
     toolName: string,
@@ -899,9 +918,9 @@ PARAMETERS:
     handler: () => Promise<T>
   ): Promise<T> {
     const startTime = Date.now();
-    
+
     try {
-      // Full request logging to console (for wrangler tail)
+      // Full request logging to console (for wrangler tail - no size limit)
       console.log(`[AUDIT] Tool Request: ${toolName}`, JSON.stringify({
         timestamp: new Date().toISOString(),
         userId: this.state.userId,
@@ -911,10 +930,10 @@ PARAMETERS:
       }));
 
       const result = await handler();
-      
+
       const duration = Date.now() - startTime;
-      
-      // Full response logging to console (for wrangler tail)
+
+      // Full response logging to console (for wrangler tail - no size limit)
       console.log(`[AUDIT] Tool Response: ${toolName}`, JSON.stringify({
         timestamp: new Date().toISOString(),
         userId: this.state.userId,
@@ -924,9 +943,10 @@ PARAMETERS:
         success: true,
         response: result,
       }));
-      
+
+      // Log to Analytics Engine with truncation for long-term storage
       await this.logToolInvocation(toolName, params, result, duration, true);
-      
+
       return result;
     } catch (error) {
       const duration = Date.now() - startTime;
@@ -952,6 +972,14 @@ PARAMETERS:
 
   /**
    * Truncate string to fit Analytics Engine blob limit (1024 bytes)
+   *
+   * Analytics Engine imposes a 1024-byte limit per blob field. We use 1000 as the
+   * default to leave room for the truncation indicator and avoid boundary issues.
+   * This ensures audit logs don't fail to write when tool results are large.
+   *
+   * @param str - String to truncate
+   * @param maxLength - Maximum length (default 1000 to stay under 1024-byte blob limit)
+   * @returns Truncated string with '...' suffix if truncation occurred
    */
   private truncateForAnalytics(str: string, maxLength: number = 1000): string {
     if (str.length <= maxLength) return str;
@@ -960,7 +988,22 @@ PARAMETERS:
 
   /**
    * Log tool invocation to Analytics Engine for audit trail
-   * Includes request params and response (truncated to fit blob limits)
+   *
+   * ANALYTICS ENGINE DATA STRUCTURE:
+   * - blobs[1-8]: String data (max 1024 bytes each) - event metadata and payloads
+   * - doubles[1-3]: Numeric metrics - duration, payload sizes for performance analysis
+   * - indexes[]: Filterable fields for efficient querying (e.g., filter by success/failure)
+   *
+   * This structured format enables:
+   * 1. Compliance auditing: Who called what, when, with what parameters
+   * 2. Usage analytics: Most-used tools, performance metrics, error rates
+   * 3. Debugging: Trace issues by tenant, user, or tool
+   *
+   * @param toolName - Name of the tool invoked
+   * @param params - Input parameters (will be truncated if large)
+   * @param result - Tool result or error object (will be truncated if large)
+   * @param durationMs - Execution time in milliseconds
+   * @param success - Whether the tool executed successfully
    */
   private async logToolInvocation(
     toolName: string,
@@ -972,7 +1015,7 @@ PARAMETERS:
     try {
       const paramsJson = JSON.stringify(params || {});
       const resultJson = JSON.stringify(result || {});
-      
+
       await this.env.ANALYTICS.writeDataPoint({
         blobs: [
           'mcp_tool_invocation',                           // blob1: event type
@@ -985,32 +1028,42 @@ PARAMETERS:
           new Date().toISOString(),                         // blob8: timestamp
         ],
         doubles: [
-          durationMs,                                       // double1: duration
-          paramsJson.length,                                // double2: request size
-          resultJson.length,                                // double3: response size
+          durationMs,                                       // double1: duration in ms
+          paramsJson.length,                                // double2: request size in bytes
+          resultJson.length,                                // double3: response size in bytes
         ],
-        indexes: [success ? 'success' : 'failure'],
+        indexes: [success ? 'success' : 'failure'],         // Filterable index for queries
       });
     } catch (error) {
+      // Don't throw - analytics failure shouldn't break tool execution
       console.error('Failed to log tool invocation:', error);
     }
   }
 
   /**
    * Set session state (called by OAuth handler after authentication)
+   *
+   * STATE MANAGEMENT PATTERN:
+   * - Session state is stored in memory within the Durable Object instance
+   * - Includes userId, tenantId, accessToken, and token expiry
+   * - When userId changes (new user), we reset initialization to force re-registration
+   * - This ensures each user gets a fresh ConsultaClient with their credentials
+   * - Durable Objects are single-tenant by design (one instance per session)
+   *
+   * @param state - Partial session state to merge with current state
    */
   async setSessionState(state: Partial<SessionState>) {
     this.state = {
       ...this.state,
       ...state,
     };
-    
-    // Reset initialization when state changes (new user/session)
+
+    // Reset initialization when userId changes to ensure new user gets fresh client
     if (state.userId && state.userId !== this.state.userId) {
       this.initialized = false;
       this.consulta = null;
     }
-    
+
     console.log('Session state set:', {
       userId: this.state.userId,
       tenantId: this.state.tenantId,
@@ -1019,7 +1072,21 @@ PARAMETERS:
 
   /**
    * Override fetch to handle MCP requests directly
-   * This bypasses the SQLite requirement from McpAgent base class
+   *
+   * IMPLEMENTATION NOTE: This bypasses the SQLite requirement from McpAgent base class
+   * by implementing the Durable Object interface directly. This avoids the overhead
+   * of SQLite for what is essentially stateless request handling.
+   *
+   * REQUEST ROUTING:
+   * 1. /set-session (or internal hostname): Session initialization from OAuth handler
+   * 2. GET requests: Health check or SSE connection establishment
+   * 3. POST with JSON-RPC: MCP protocol requests (initialize, tools/list, tools/call)
+   *
+   * JSON-RPC METHODS SUPPORTED:
+   * - initialize: Protocol handshake, returns capabilities and server info
+   * - tools/list: Returns all registered tools with schemas
+   * - tools/call: Executes a specific tool by name
+   * - notifications/initialized: Client notification (no response needed)
    */
   async fetch(request: Request): Promise<Response> {
     console.log('ComplianceMCP.fetch called', {
@@ -1027,10 +1094,10 @@ PARAMETERS:
       method: request.method,
       pathname: new URL(request.url).pathname,
     });
-    
+
     const url = new URL(request.url);
-    
-    // Handle internal session setup requests
+
+    // Handle internal session setup requests (called by OAuth handler after authentication)
     if (url.pathname === '/set-session' || url.hostname === 'internal') {
       try {
         const body = await request.json();
@@ -1057,9 +1124,9 @@ PARAMETERS:
     // Initialize MCP server if not already done
     await this.init();
     console.log('After init, toolHandlers size:', this.toolHandlers.size);
-    
-    // Handle MCP protocol requests (JSON-RPC over HTTP)
-    // Parse JSON-RPC request and route to appropriate handler
+
+    // Handle MCP protocol requests (JSON-RPC 2.0 over HTTP)
+    // All MCP messages use JSON-RPC format: { jsonrpc, id, method, params }
     let requestId: any = null;
     try {
       // Handle GET requests (health check or SSE connection establishment)
@@ -1078,15 +1145,15 @@ PARAMETERS:
       }
 
       const body = await request.json();
-      
-      // Validate body is not null/undefined
+
+      // Validate JSON-RPC request structure
       if (!body || typeof body !== 'object') {
         console.error('Invalid request body:', body);
         return new Response(JSON.stringify({
           jsonrpc: '2.0',
           id: null,
           error: {
-            code: -32700,
+            code: -32700, // JSON-RPC Parse error code
             message: 'Parse error',
             data: 'Request body is null or not an object',
           },
@@ -1098,13 +1165,14 @@ PARAMETERS:
 
       const { jsonrpc, id, method, params } = body;
       requestId = id; // Save for error handling
-      
+
+      // Validate JSON-RPC version
       if (jsonrpc !== '2.0') {
         return new Response(JSON.stringify({
           jsonrpc: '2.0',
           id,
           error: {
-            code: -32600,
+            code: -32600, // JSON-RPC Invalid Request code
             message: 'Invalid Request',
             data: 'jsonrpc must be "2.0"',
           },
@@ -1113,8 +1181,8 @@ PARAMETERS:
           headers: { 'Content-Type': 'application/json' },
         });
       }
-      
-      // Route to appropriate handler
+
+      // Route JSON-RPC method to appropriate handler
       let result;
       if (method === 'tools/list') {
         // Build tools list from registered tools
@@ -1127,15 +1195,15 @@ PARAMETERS:
         console.log('Returning tools:', tools.map(t => t.name));
         result = { tools };
       } else if (method === 'tools/call') {
+        // Execute a specific tool by name
         const { name, arguments: args } = params || {};
-        // Call the tool handler directly from our map
         const toolDef = this.toolHandlers.get(name);
         if (!toolDef) {
           return new Response(JSON.stringify({
             jsonrpc: '2.0',
             id,
             error: {
-              code: -32601,
+              code: -32601, // JSON-RPC Method not found code
               message: 'Tool not found',
               data: `Tool "${name}" is not registered`,
             },
@@ -1144,12 +1212,16 @@ PARAMETERS:
             headers: { 'Content-Type': 'application/json' },
           });
         }
+
+        // Execute tool handler (wrapped with audit logging)
         const toolResult = await toolDef.handler(args || {});
-        // MCP protocol: tool results must have content array with type: text
-        // Check if already wrapped (some handlers might return wrapped format)
+
+        // MCP protocol requires: { content: [{ type: 'text', text: '...' }] }
+        // Some handlers might already return wrapped format, so check first
         if (toolResult && toolResult.content && Array.isArray(toolResult.content)) {
-          result = toolResult; // Already in correct format
+          result = toolResult; // Already in correct MCP format
         } else {
+          // Wrap plain result in MCP content format
           result = {
             content: [{
               type: 'text',
@@ -1158,13 +1230,12 @@ PARAMETERS:
           };
         }
       } else if (method === 'initialize') {
-        // Return MCP protocol initialization response
-        // capabilities must be an object, even if empty
+        // MCP protocol handshake - returns server capabilities and version
         result = {
           protocolVersion: '2024-11-05',
           capabilities: {
             tools: {
-              listChanged: false,
+              listChanged: false, // We don't support dynamic tool list updates
             },
           },
           serverInfo: {
